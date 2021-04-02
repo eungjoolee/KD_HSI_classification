@@ -12,6 +12,8 @@ import os
 import datetime
 import numpy as np
 import joblib
+from utils import AverageMeter, Logger
+from center_loss import CenterLoss
 
 from tqdm import tqdm
 from utils import grouper, sliding_window, count_sliding_window, camel_to_snake
@@ -108,6 +110,9 @@ def get_model(name, **kwargs):
         model = model.to(device)
         optimizer = optim.Adagrad(model.parameters(), lr=lr, weight_decay=0.01)
         criterion = nn.CrossEntropyLoss(weight=kwargs["weights"])
+        ## Center-Loss
+        criterion_cent = CenterLoss(num_classes=n_classes, feat_dim=2, use_gpu=use_gpu)
+        optimizer_cent = torch.optim.SGD(criterion_cent.parameters(), lr=0.5)
     elif name == "he_customized":
         kwargs.setdefault("patch_size", 7)
         kwargs.setdefault("batch_size", 40)
@@ -209,7 +214,7 @@ def get_model(name, **kwargs):
     kwargs.setdefault("radiation_augmentation", False)
     kwargs.setdefault("mixture_augmentation", False)
     kwargs["center_pixel"] = center_pixel
-    return model, optimizer, criterion, kwargs
+    return model, optimizer, criterion, criterion_cent, optimizer_cent, kwargs
 
 
 class Baseline(nn.Module):
@@ -764,7 +769,9 @@ class HeEtAl(nn.Module):
 
         self.features_size = self._get_final_flattened_size()
 
-        self.fc = nn.Linear(self.features_size, n_classes)
+        self.fc1 = nn.Linear(self.features_size, 2)
+        self.prelu_fc1 =nn.PReLu()
+        self.fc2 = nn.Linear(2, n_classes)
 
         self.apply(self.weight_init)
 
@@ -806,7 +813,9 @@ class HeEtAl(nn.Module):
         x = x.view(-1, self.features_size)
         x = self.dropout(x)
         x = self.fc(x)
-        return x
+        x = self.prelu_fc1(self.fc1(x))
+        y = self.fc2(x)
+        return x, y
 
 class LuoEtAl(nn.Module):
     """
@@ -1135,6 +1144,8 @@ def train(
     net,
     optimizer,
     criterion,
+    criterion_cent, 
+    optimizer_cent, 
     data_loader,
     epoch,
     scheduler=None,
@@ -1162,6 +1173,7 @@ def train(
         supervision (optional): 'full' or 'semi'
     """
 
+
     if criterion is None:
         raise Exception("Missing criterion. You must specify a loss function.")
 
@@ -1171,6 +1183,8 @@ def train(
 
     losses = np.zeros(1000000)
     mean_losses = np.zeros(100000000)
+    mean_xent_losses = np.zeros(100000000)
+    mean_cent_losses = np.zeros(100000000)
     iter_ = 1
     loss_win, val_win = None, None
     val_accuracies = []
@@ -1182,6 +1196,8 @@ def train(
         # Set the network to training mode
         net.train()
         avg_loss = 0.0
+        xent_losses = 0.0
+        cent_losses = 0.0
 
         # Run the training loop for one epoch
         for batch_idx, (data, target) in tqdm(
@@ -1191,9 +1207,15 @@ def train(
             data, target = data.to(device), target.to(device)
 
             optimizer.zero_grad()
+            optimizer_cent.zero_grad()
+
             if supervision == "full":
-                output = net(data)
-                loss = criterion(output, target)
+                features, output = net(data)
+                loss_xent = criterion(output, target)
+                loss_cent = criterion(features, target)
+                loss_cent *= 1
+                loss = loss_xent + loss_cent
+
             elif supervision == "semi":
                 outs = net(data)
                 output, rec = outs
@@ -1206,10 +1228,20 @@ def train(
                 )
             loss.backward()
             optimizer.step()
+            
+            # by doing so, weight_cent would not impact on the learning of centers
+            for param in criterion_cent.parameters():
+                param.grad.data *= (1. / 1)
+            optimizer_cent.step()
 
             avg_loss += loss.item()
+            xent_losses += loss_xent.item()
+            cent_losses += loss_cent.item()
+
             losses[iter_] = loss.item()
             mean_losses[iter_] = np.mean(losses[max(0, iter_ - 100) : iter_ + 1])
+            mean_xent_losses[iter_] = np.mean(loss_xent[max(0, iter_ - 100) : iter_ + 1])
+            mean_cent_losses[iter_] = np.mean(loss_cent[max(0, iter_ - 100) : iter_ + 1])
 
             if display_iter and iter_ % display_iter == 0:
                 string = "Train (epoch {}/{}) [{}/{} ({:.0f}%)]\tLoss: {:.6f}"
@@ -1220,17 +1252,24 @@ def train(
                     len(data) * len(data_loader),
                     100.0 * batch_idx / len(data_loader),
                     mean_losses[iter_],
+                    mean_xent_losses[iter_],
+                    mean_cent_losses[iter_]
                 )
                 update = None if loss_win is None else "append"                
                 loss_win = display.line(
                     X=np.arange(iter_ - display_iter, iter_),
                     Y=mean_losses[iter_ - display_iter : iter_],
+                    Z=mean_xent_losses[iter_ - display_iter : iter_],
+                    Q=mean_cent_losses[iter_ - display_iter : iter_],
+
                     win=loss_win,
                     update=update,
                     opts={
                         "title": train_title,
                         "xlabel": "Iterations",
-                        "ylabel": "Loss",
+                        "ylabel": "Total Loss",
+                        "zlabel": "Loss"
+                        "qlabel": "Center_Loss"
                     },
                 )
                 tqdm.write(string)
@@ -1251,6 +1290,9 @@ def train(
 
         # Update the scheduler
         avg_loss /= len(data_loader)
+        xent_losses /= len(data_loader)
+        cent_losses /= len(data_loader)
+
         if val_loader is not None:
             val_acc = val(net, val_loader, device=device, supervision=supervision)
             val_accuracies.append(val_acc)

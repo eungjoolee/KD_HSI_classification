@@ -430,8 +430,8 @@ for run in range(N_RUNS):
         if CLASS_BALANCING:
             weights = compute_imf_weights(train_gt, N_CLASSES, IGNORED_LABELS)
             hyperparams["weights"] = torch.from_numpy(weights)
-        # Neural network
-        model, optimizer, loss, hyperparams = get_model(MODEL, **hyperparams)
+        # Neural network with the center_loss
+        model, optimizer, loss, loss_cent, optimizer_cent, hyperparams = get_model(MODEL, **hyperparams)
 
         # Split train set in train/val
         if VAL_GT is not None:
@@ -475,6 +475,8 @@ for run in range(N_RUNS):
                 model,
                 optimizer,
                 loss,
+                loss_cent, 
+                optimizer_cent,
                 train_loader,
                 hyperparams["epoch"],
                 scheduler=hyperparams["scheduler"],
